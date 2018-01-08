@@ -845,10 +845,9 @@ get_certificate() { # get certificate for csr, if all domains validated.
       info "The intermediate CA cert is in $gc_cafile"
     fi
   else # APIv2
-    send_signed_request "$FinalizeLink" "{\"csr\": \"$der\"}" "needbase64"
-    debug "order link was $OrderLink"
-    cd=$(curl --silent "$OrderLink")
-    CertData=$(json_get "$cd" "certificate")
+    send_signed_request "$FinalizeLink" "{\"csr\": \"$der\"}"
+    debug "response is $response"
+    CertData=$(json_get "$response" "certificate")
     debug "CertData is at $CertData"
     curl --silent "$CertData" > "$CERT_FILE"
     info "Certificate saved in $CERT_FILE"
@@ -2203,21 +2202,45 @@ for d in $alldomains; do
       fi
       debug primary_ns "$primary_ns"
 
-      # make a directory to hold pending dns-challenges
-      if [[ ! -d "$TEMP_DIR/dns_verify" ]]; then
-        mkdir "$TEMP_DIR/dns_verify"
-      fi
+      # check for token at public dns server, waiting for a valid response.
+      for ns in $primary_ns; do
+        debug "checking dns at $ns"
+        ntries=0
+        check_dns="fail"
+        while [[ "$check_dns" == "fail" ]]; do
+          if [[ "$os" == "cygwin" ]]; then
+            check_result=$(nslookup -type=txt "_acme-challenge.${ddns}" "${ns}" \
+                           | grep ^_acme -A2\
+                           | grep '"'|awk -F'"' '{ print $2}')
+          elif [[ "$DNS_CHECK_FUNC" == "drill" ]] || [[ "$DNS_CHECK_FUNC" == "dig" ]]; then
+            check_result=$($DNS_CHECK_FUNC TXT "_acme-challenge.${ddns}" "@${ns}" \
+                           | grep ^_acme|awk -F'"' '{ print $2}')
+          elif [[ "$DNS_CHECK_FUNC" == "host" ]]; then
+            check_result=$($DNS_CHECK_FUNC -t TXT "_acme-challenge.${ddns}" "${ns}" \
+                           | grep ^_acme|awk -F'"' '{ print $2}')
+          else
+            check_result=$(nslookup -type=txt "_acme-challenge.${ddns}" "${ns}" \
+                           | grep ^_acme|awk -F'"' '{ print $2}')
+          fi
+          debug "expecting  $auth_key"
+          debug "${ns} gave ... $check_result"
 
-      # generate a file with the current variables for the dns-challenge
-      cat > "$TEMP_DIR/dns_verify/$d" <<- _EOF_
-			token="${token}"
-			uri="${uri}"
-			keyauthorization="${keyauthorization}"
-			d="${d}"
-			primary_ns="${primary_ns}"
-			auth_key="${auth_key}"
-			_EOF_
-
+          if [[ "$check_result" == *"$auth_key"* ]]; then
+            check_dns="success"
+          else
+            if [[ $ntries -lt 100 ]]; then
+              ntries=$(( ntries + 1 ))
+              info "checking DNS at ${ns} for ${d}. Attempt $ntries/100 gave wrong result, "\
+                "waiting $DNS_WAIT secs before checking again"
+              sleep $DNS_WAIT
+            else
+              debug "dns check failed - removing existing value"
+              error_exit "checking _acme-challenge.${ddns} gave $check_result not $auth_key"
+            fi
+          fi
+        done
+      done
+      
     else      # set up the correct http token for verification
       if [[ $API -eq 1 ]]; then
         # get the token from the http component
@@ -2301,88 +2324,24 @@ for d in $alldomains; do
         fi
       done
     fi
-    # increment domain-counter
-    ((dn++))
-  fi
-done # end of ... loop through domains for cert ( from SANS list)
-
-# perform validation if via DNS challenge
 if [[ $VALIDATE_VIA_DNS == "true" ]]; then
-  # loop through dns-variable files to check if dns has been changed
-  for dnsfile in $TEMP_DIR/dns_verify/*; do
-    if [[ -e "$dnsfile" ]]; then
-      debug "loading DNSfile: $dnsfile"
-      # shellcheck source=/dev/null
-      . "$dnsfile"
-      if [[ "$skip" -eq 1 ]]; then
-        echo skip
-        continue
-      fi
-
-      # check for token at public dns server, waiting for a valid response.
-      for ns in $primary_ns; do
-        debug "checking dns at $ns"
-        ntries=0
-        check_dns="fail"
-        while [[ "$check_dns" == "fail" ]]; do
-          if [[ "$os" == "cygwin" ]]; then
-            check_result=$(nslookup -type=txt "_acme-challenge.${d}" "${ns}" \
-                           | grep ^_acme -A2\
-                           | grep '"'|awk -F'"' '{ print $2}')
-          elif [[ "$DNS_CHECK_FUNC" == "drill" ]] || [[ "$DNS_CHECK_FUNC" == "dig" ]]; then
-            check_result=$($DNS_CHECK_FUNC TXT "_acme-challenge.${d}" "@${ns}" \
-                           | grep ^_acme|awk -F'"' '{ print $2}')
-          elif [[ "$DNS_CHECK_FUNC" == "host" ]]; then
-            check_result=$($DNS_CHECK_FUNC -t TXT "_acme-challenge.${d}" "${ns}" \
-                           | grep ^_acme|awk -F'"' '{ print $2}')
-          else
-            check_result=$(nslookup -type=txt "_acme-challenge.${d}" "${ns}" \
-                           | grep ^_acme|awk -F'"' '{ print $2}')
-          fi
-          debug "expecting  $auth_key"
-          debug "${ns} gave ... $check_result"
-
-          if [[ "$check_result" == *"$auth_key"* ]]; then
-            check_dns="success"
-          else
-            if [[ $ntries -lt 100 ]]; then
-              ntries=$(( ntries + 1 ))
-              info "checking DNS at ${ns} for ${d}. Attempt $ntries/100 gave wrong result, "\
-                "waiting $DNS_WAIT secs before checking again"
-              sleep $DNS_WAIT
-            else
-              debug "dns check failed - removing existing value"
-              error_exit "checking _acme-challenge.${d} gave $check_result not $auth_key"
-            fi
-          fi
-        done
-      done
-    fi
-  done
-
   if [[ "$DNS_EXTRA_WAIT" -gt 0 && "$PREVIOUSLY_VALIDATED" != "true" ]]; then
     info "sleeping $DNS_EXTRA_WAIT seconds before asking the ACME-server to check the dns"
     sleep "$DNS_EXTRA_WAIT"
   fi
 
-  # loop through dns-variable files to let the ACME server check the challenges
-  for dnsfile in $TEMP_DIR/dns_verify/*; do
-    if [[ -e "$dnsfile" ]]; then
-      debug "loading DNSfile: $dnsfile"
-      # shellcheck source=/dev/null
-      . "$dnsfile"
 
-      check_challenge_completion "$uri" "$d" "$keyauthorization"
+  check_challenge_completion "$uri" "$d" "$keyauthorization"
 
-      debug "remove DNS entry"
-      eval "$DNS_DEL_COMMAND" "$d" "$auth_key"
-      # remove $dnsfile after each loop.
-      rm -f "$dnsfile"
-    fi
-  done
+  debug "remove DNS entry"
+  eval "$DNS_DEL_COMMAND" "$d" "$auth_key"
 fi
-# end of ... perform validation if via DNS challenge
-#end of varify each domain.
+
+    # increment domain-counter
+    ((dn++))
+  fi
+done # end of ... loop through domains for cert ( from SANS list)
+
 
 # Verification has been completed for all SANS, so  request certificate.
 info "Verification completed, obtaining certificate."
