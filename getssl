@@ -2096,6 +2096,7 @@ if [[ "$IGNORE_DIRECTORY_DOMAIN" == "true" ]]; then
 else
   alldomains=$(echo "$DOMAIN,$SANS" | sed "s/,/ /g")
 fi
+echo $alldomains
 
 if [[ $API -eq 2 ]]; then
   dstring="["
@@ -2115,7 +2116,7 @@ if [[ $API -eq 2 ]]; then
   dn=0
   for d in $alldomains; do
     # get authorizations link
-    AuthLink[$dn]=$(json_get "$response" "identifiers" "value" "$d" "authorizations" "x")
+    AuthLink[$dn]=$(json_get "$response" "identifiers" "value" "$(echo "$d" | sed -e "s/\*/\\\\*/")" "authorizations" "x")
     debug "authorizations link for $d - ${AuthLink[$dn]}"
     ((dn++))
   done
@@ -2187,8 +2188,10 @@ for d in $alldomains; do
                  | sed -e 's:=*$::g' -e 'y:+/:-_:')
       debug auth_key "$auth_key"
 
-      debug "adding dns via command: $DNS_ADD_COMMAND $d $auth_key"
-      if ! eval "$DNS_ADD_COMMAND" "$d" "$auth_key" ; then
+      ddns="$(echo "$d" | sed "s/^\*\.//")"
+
+      debug "adding dns via command: $DNS_ADD_COMMAND $ddns $auth_key"
+      if ! eval "$DNS_ADD_COMMAND" "$ddns" "$auth_key" ; then
         error_exit "DNS_ADD_COMMAND failed for domain $d"
       fi
 
@@ -2311,6 +2314,10 @@ if [[ $VALIDATE_VIA_DNS == "true" ]]; then
       debug "loading DNSfile: $dnsfile"
       # shellcheck source=/dev/null
       . "$dnsfile"
+      if [[ "$skip" -eq 1 ]]; then
+        echo skip
+        continue
+      fi
 
       # check for token at public dns server, waiting for a valid response.
       for ns in $primary_ns; do
